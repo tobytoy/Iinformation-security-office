@@ -1,4 +1,4 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient, RealtimeChannel } from '@supabase/supabase-js';
 import { Challenge, IntelItem, ChatMessage, UserProfile } from '../types';
 
 // ⚠️ Credentials must be set in .env — no hardcoded fallbacks in production
@@ -15,7 +15,7 @@ const STORAGE_CHALLENGES_KEY = 'sec_exchange_challenges';
 const STORAGE_INTEL_KEY = 'sec_exchange_intel';
 const STORAGE_CHAT_KEY = 'sec_exchange_chat';
 
-// Default LiveFire / Defense Competition Incidents matching user requirements
+// Default LiveFire / Defense Competition Incidents
 const DEFAULT_CHALLENGES: Challenge[] = [
   {
     id: 'c-live-1',
@@ -90,7 +90,7 @@ const DEFAULT_CHALLENGES: Challenge[] = [
   }
 ];
 
-// Default LiveFire Intelligence data matching user screenshots
+// Default LiveFire Intelligence data
 const DEFAULT_INTEL: IntelItem[] = [
   {
     id: 'intel-1',
@@ -181,7 +181,8 @@ const DEFAULT_CHAT: ChatMessage[] = [
   }
 ];
 
-// Helper for User Profile
+// ─── User Profile ───────────────────────────────────────────────────────────
+
 export function getSavedUserProfile(): UserProfile {
   const saved = localStorage.getItem(STORAGE_USER_KEY);
   if (saved) {
@@ -198,7 +199,8 @@ export function saveUserProfile(profile: UserProfile): void {
   localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(profile));
 }
 
-// Challenges API
+// ─── Challenges API (localStorage) ──────────────────────────────────────────
+
 export function loadChallenges(): Challenge[] {
   const saved = localStorage.getItem(STORAGE_CHALLENGES_KEY);
   if (saved) {
@@ -225,7 +227,8 @@ export function saveChallenges(challenges: Challenge[]): void {
   notifyStorageChange();
 }
 
-// Intel API
+// ─── Intel API (localStorage) ────────────────────────────────────────────────
+
 export function loadIntel(): IntelItem[] {
   const saved = localStorage.getItem(STORAGE_INTEL_KEY);
   if (saved) {
@@ -250,14 +253,109 @@ export function saveIntel(intel: IntelItem[]): void {
   notifyStorageChange();
 }
 
-// Chat API
-export function loadChatMessages(): ChatMessage[] {
+// ─── Chat API — Supabase Realtime (cross-device) ─────────────────────────────
+// Falls back to localStorage if Supabase unavailable.
+// Supabase table required:
+//   CREATE TABLE chat_messages (
+//     id TEXT PRIMARY KEY,
+//     sender TEXT NOT NULL,
+//     role TEXT NOT NULL,
+//     text TEXT NOT NULL,
+//     is_code BOOLEAN DEFAULT false,
+//     created_at TIMESTAMPTZ DEFAULT now()
+//   );
+//   ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
+//   CREATE POLICY "anon read" ON chat_messages FOR SELECT USING (true);
+//   CREATE POLICY "anon insert" ON chat_messages FOR INSERT WITH CHECK (true);
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHAT_TABLE = 'chat_messages';
+
+/** Load recent messages from Supabase (last 200), or localStorage fallback */
+export async function loadChatMessagesFromDB(): Promise<ChatMessage[]> {
+  if (!supabase) return loadChatMessagesLocal();
+  const { data, error } = await supabase
+    .from(CHAT_TABLE)
+    .select('*')
+    .order('created_at', { ascending: true })
+    .limit(200);
+  if (error || !data) {
+    console.warn('Supabase chat load failed, using localStorage:', error?.message);
+    return loadChatMessagesLocal();
+  }
+  return data.map(rowToMessage);
+}
+
+/** Send a message — inserts into Supabase; falls back to localStorage */
+export async function sendChatMessage(msg: ChatMessage): Promise<void> {
+  if (!supabase) {
+    const current = loadChatMessagesLocal();
+    localStorage.setItem(STORAGE_CHAT_KEY, JSON.stringify([...current, msg]));
+    notifyStorageChange();
+    return;
+  }
+  const { error } = await supabase.from(CHAT_TABLE).insert({
+    id: msg.id,
+    sender: msg.sender,
+    role: msg.role,
+    text: msg.text,
+    is_code: msg.isCode ?? false,
+    created_at: msg.createdAt
+  });
+  if (error) {
+    console.warn('Supabase chat send failed, saving locally:', error.message);
+    const current = loadChatMessagesLocal();
+    localStorage.setItem(STORAGE_CHAT_KEY, JSON.stringify([...current, msg]));
+    notifyStorageChange();
+  }
+}
+
+/** Subscribe to new chat messages via Supabase Realtime */
+export function subscribeToChat(onNew: (msg: ChatMessage) => void): () => void {
+  if (!supabase) {
+    // Fallback: BroadcastChannel works only within same device/browser
+    return subscribeToStoreChanges(() => {});
+  }
+  let channel: RealtimeChannel | null = null;
+  channel = supabase
+    .channel('chat_realtime')
+    .on(
+      'postgres_changes',
+      { event: 'INSERT', schema: 'public', table: CHAT_TABLE },
+      (payload) => {
+        onNew(rowToMessage(payload.new as Record<string, unknown>));
+      }
+    )
+    .subscribe();
+
+  return () => {
+    channel?.unsubscribe();
+  };
+}
+
+function rowToMessage(row: Record<string, unknown>): ChatMessage {
+  return {
+    id: row.id as string,
+    sender: row.sender as string,
+    role: row.role as string,
+    text: row.text as string,
+    isCode: (row.is_code as boolean) ?? false,
+    createdAt: (row.created_at as string) ?? new Date().toISOString()
+  };
+}
+
+// localStorage chat (offline fallback)
+function loadChatMessagesLocal(): ChatMessage[] {
   const saved = localStorage.getItem(STORAGE_CHAT_KEY);
   if (saved) {
     try { return JSON.parse(saved); } catch (e) { /* ignore */ }
   }
-  localStorage.setItem(STORAGE_CHAT_KEY, JSON.stringify(DEFAULT_CHAT));
   return DEFAULT_CHAT;
+}
+
+/** Legacy export — returns local messages synchronously */
+export function loadChatMessages(): ChatMessage[] {
+  return loadChatMessagesLocal();
 }
 
 export function saveChatMessages(messages: ChatMessage[]): void {
@@ -265,16 +363,15 @@ export function saveChatMessages(messages: ChatMessage[]): void {
   notifyStorageChange();
 }
 
-// BroadcastChannel for multi-tab sync
+// ─── BroadcastChannel (same-device multi-tab sync) ──────────────────────────
+
 let broadcastChannel: BroadcastChannel | null = null;
 if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
   broadcastChannel = new BroadcastChannel('sec_exchange_sync');
 }
 
 function notifyStorageChange() {
-  if (broadcastChannel) {
-    broadcastChannel.postMessage({ type: 'SYNC_UPDATE', timestamp: Date.now() });
-  }
+  broadcastChannel?.postMessage({ type: 'SYNC_UPDATE', timestamp: Date.now() });
 }
 
 export function subscribeToStoreChanges(callback: () => void): () => void {
